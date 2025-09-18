@@ -1,33 +1,31 @@
-//! 最小化 MinIO(S3兼容)对象下载工具
-//! 仅依赖 reqwest，直接实现 S3 V4 签名，包体积极小
+//! 极小依赖 MinIO(S3兼容)对象部分下载工具
+//! 仅依赖 minreq、hmac、sha2，全部同步实现
 
 use std::env;
 use std::process::exit;
 use std::io::{self, Write};
-use clap::Parser;
-use dotenvy::dotenv;
-use chrono::{Utc, DateTime};
+use std::time::{SystemTime, UNIX_EPOCH};
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
-use reqwest::Client;
-use reqwest::header::{HeaderMap, HeaderValue, HOST, CONTENT_TYPE, AUTHORIZATION};
-use tokio::io::AsyncWriteExt;
-
-/// 命令行参数结构体
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// MinIO对象路径，格式为 /bucket/object/path
-    object_path: String,
-    /// 读取大小，单位KB，留空则读取完整文件
-    transfer_size: Option<usize>,
-}
+use minreq;
 
 /// 计算SHA256十六进制字符串
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+/// HMAC-SHA256
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    format!("{:x}", mac.finalize().into_bytes())
 }
 
 /// 生成 AWS S3 V4 签名（仅支持 GET Object，最小实现）
@@ -40,10 +38,9 @@ fn s3_sign_v4(
     secret_key: &str,
     query: &str,
     payload_hash: &str,
-    now: DateTime<Utc>,
-) -> (String, String) {
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
+    amz_date: &str,
+    date: &str,
+) -> String {
     let credential_scope = format!("{}/{}/s3/aws4_request", date, region);
 
     // Canonical Request
@@ -76,29 +73,13 @@ fn s3_sign_v4(
     let signature = hmac_sha256_hex(&k_signing, string_to_sign.as_bytes());
 
     // Authorization header
-    let auth = format!(
+    format!(
         "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
         access_key, credential_scope, signed_headers, signature
-    );
-    (auth, amz_date)
+    )
 }
 
-/// HMAC-SHA256
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-    mac.update(data);
-    format!("{:x}", mac.finalize().into_bytes())
-}
-
-#[tokio::main]
-async fn main() {
-    dotenv().ok(); // 加载.env（如有）
-
+fn main() {
     // 读取环境变量
     let endpoint = env::var("DATAFLUX_OSS_ADDRESS").unwrap_or_else(|_| {
         eprintln!("环境变量 DATAFLUX_OSS_ADDRESS 未设置");
@@ -114,8 +95,29 @@ async fn main() {
     });
 
     // 解析命令行参数
-    let args = Args::parse();
-    let object_path = args.object_path.trim_start_matches('/'); // 去除前导斜杠
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("用法: minio_reader /bucket/object/path [transfer_size_KB] [--debug]");
+        exit(1);
+    }
+    // 判断是否有 --debug
+    let mut debug = false;
+    let mut object_path = "";
+    let mut transfer_size_bytes = None;
+    for arg in &args[1..] {
+        if arg == "--debug" {
+            debug = true;
+        }
+    }
+    // 解析 object_path 和 transfer_size
+    let mut arg_iter = args[1..].iter().filter(|a| *a != "--debug");
+    object_path = match arg_iter.next() {
+        Some(s) => s.trim_start_matches('/'),
+        None => {
+            eprintln!("objectPath 缺失，需为 /bucket/object/path");
+            exit(1);
+        }
+    };
     let mut parts = object_path.splitn(2, '/');
     let bucket = parts.next().unwrap_or("");
     let key = parts.next().unwrap_or("");
@@ -123,21 +125,42 @@ async fn main() {
         eprintln!("objectPath 格式错误，需为 /bucket/object/path");
         exit(1);
     }
-
-    // 读取 transfer_size
-    let transfer_size_bytes = args.transfer_size.map(|kb| kb * 1024);
+    transfer_size_bytes = match arg_iter.next() {
+        Some(s) => s.parse::<usize>().ok().map(|kb| kb * 1024),
+        None => None,
+    };
 
     // 构造 S3 GET Object URL
     let region = "us-east-1"; // MinIO 默认兼容
     let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
 
     // S3 V4 签名
-    let now = Utc::now();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let tm = unsafe {
+        let mut out = std::mem::zeroed();
+        libc::gmtime_r(&now, &mut out);
+        out
+    };
+    let amz_date = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    );
+    let date = format!(
+        "{:04}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday
+    );
     let uri = format!("/{}/{}", bucket, key);
     let host = endpoint.trim_start_matches("http://").trim_start_matches("https://");
     let query = "";
     let payload_hash = sha256_hex(b"");
-    let (auth, amz_date) = s3_sign_v4(
+    let auth = s3_sign_v4(
         "GET",
         &uri,
         host,
@@ -146,44 +169,55 @@ async fn main() {
         &secret_key,
         query,
         &payload_hash,
-        now,
+        &amz_date,
+        &date,
     );
 
-    // 构造请求头
-    let mut headers = HeaderMap::new();
-    headers.insert(HOST, HeaderValue::from_str(host).unwrap());
-    headers.insert("x-amz-content-sha256", HeaderValue::from_str(&payload_hash).unwrap());
-    headers.insert("x-amz-date", HeaderValue::from_str(&amz_date).unwrap());
-    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth).unwrap());
+    // 输出调试信息（仅在 --debug 时）
+    if debug {
+        eprintln!("调试信息:");
+        eprintln!("URL: {}", url);
+        eprintln!("Host: {}", host);
+        eprintln!("amz_date: {}", amz_date);
+        eprintln!("date: {}", date);
+        eprintln!("Authorization: {}", auth);
+        eprintln!("x-amz-content-sha256: {}", payload_hash);
+    }
 
-    // 发起 GET 请求
-    let client = Client::new();
-    let resp = match client.get(&url).headers(headers).send().await {
+    // 构造请求
+    let resp = minreq::get(&url)
+        // .with_header("Host", host) // 先去掉 Host 头，使用 minreq 默认
+        .with_header("x-amz-content-sha256", &payload_hash)
+        .with_header("x-amz-date", &amz_date)
+        .with_header("Authorization", &auth)
+        .with_header("Accept-Encoding", "identity")
+        .with_header("Connection", "close")
+        .send();
+
+    let resp = match resp {
         Ok(r) => r,
         Err(e) => {
             eprintln!("获取对象失败: {e}");
             exit(1);
         }
     };
-    if !resp.status().is_success() {
-        eprintln!("HTTP错误: {}", resp.status());
+    if resp.status_code != 200 {
+        eprintln!("HTTP错误: {}", resp.status_code);
+        if debug {
+            eprintln!("响应内容: {}", String::from_utf8_lossy(resp.as_bytes()));
+        }
         exit(1);
     }
 
     // 读取并输出内容
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("读取对象内容失败: {e}");
-            exit(1);
-        }
-    };
-    let mut writer = tokio::io::stdout();
+    let bytes = resp.as_bytes();
     let to_write = match transfer_size_bytes {
         Some(limit) => std::cmp::min(bytes.len(), limit),
         None => bytes.len(),
     };
-    if writer.write_all(&bytes[..to_write]).await.is_err() {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    if handle.write_all(&bytes[..to_write]).is_err() {
         eprintln!("写入 stdout 失败");
         exit(1);
     }

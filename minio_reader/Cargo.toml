@@ -1,14 +1,10 @@
 [package]
 name = "minio_reader"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
-dotenvy = "0.15"
-chrono = "0.4"
+minreq = "2.8"
 hmac = "0.12"
 sha2 = "0.10"
-futures-util = "0.3"
+libc = "0.2"
