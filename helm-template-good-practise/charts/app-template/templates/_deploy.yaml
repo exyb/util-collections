@@ -1,0 +1,37 @@
+{{- define "applibchart.deploy.tpl" }}
+apiVersion: {{ .Values.kubeApiVersion }}
+kind: Deployment
+metadata:
+  name: {{ .Values.appName  }}
+spec:
+  replicas: {{ .Values.replicaCount  }}
+  selector:
+    matchLabels:
+      app: {{ .Values.appName  }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.appName  }}
+    spec:
+      containers:
+        - name: {{ .Values.appName }}
+          image: "{{ .Values.image.imageName }}:{{ .Values.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+{{- end }}
+
+
+{{- define "applibchart.deploy" -}}
+{{- include "applibchart.util.merge" (append . "applibchart.deploy.tpl") -}}
+{{- end -}}

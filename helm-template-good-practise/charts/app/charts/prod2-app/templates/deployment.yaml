@@ -1,0 +1,18 @@
+{{- include "applibchart.deploy" (list . "app.deployment") -}}
+{{- define "app.deployment" -}}
+spec:
+  template:
+    spec:
+      containers:
+        - name: {{ .Values.appName }}-prod1
+          image: "{{ .Values.image.imageName }}:{{ .Values.image.tag }}"
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+{{- end -}}

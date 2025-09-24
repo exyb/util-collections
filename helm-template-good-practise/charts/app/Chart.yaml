@@ -1,0 +1,22 @@
+apiVersion: v2
+name: app
+version: 0.0.1
+description: app Helm chart.
+  
+
+dependencies:
+  - name: prod1-app
+    condition: prod.prod1,global.app.enabled
+    tags:
+      - backend
+      - prod1
+  - name: prod1-ui
+    condition: prod.prod1,global.app.enabled
+    tags:
+      - front
+      - prod1
+  - name: prod2-app
+    condition: prod.prod2,global.app.enabled
+    tags:
+      - backend
+      - prod2
