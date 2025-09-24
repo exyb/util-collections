@@ -49,7 +49,7 @@ func getTag(image string) string {
 }
 
 func getRepoName(image string) string {
-	// harbor.asiainfo.com/dataflux/dataflux-auth:release-1.3.0_20250819180001
+	// harbor.example.com/dataflux/dataflux-auth:release-1.3.0_20250819180001
 	parts := strings.Split(image, "/")
 	last := parts[len(parts)-1]
 	return strings.Split(last, ":")[0]
